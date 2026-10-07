@@ -1,4 +1,4 @@
-## Interface: 120100 120007
+## Interface: 120100, 120007
 ## Title: |cFF8AC8FFthings|r for EUI (old settings)
 ## Notes: Carries your settings over from the addon's old folder name. Safe to delete after one login with things for EUI.
 ## Author: A frickin robot

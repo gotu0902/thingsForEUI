@@ -1,4 +1,4 @@
-## Interface: 120100 120007
+## Interface: 120100, 120007
 ## Title: |cFF8AC8FFthings|r for EUI
 ## Notes: EUI tweaks, QoL and stuff for healing thigs.
 ## Author: A frickin robot
