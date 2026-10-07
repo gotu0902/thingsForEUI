@@ -1,0 +1,12 @@
+package-as: thingsForEUI
+
+manual-changelog:
+  filename: CHANGELOG.md
+  markup-type: markdown
+
+# settings bridge for the old folder name: its own top-level folder in the zip
+move-folders:
+  thingsForEUI/EllesmereUIThings: EllesmereUIThings
+
+ignore:
+  - README.md

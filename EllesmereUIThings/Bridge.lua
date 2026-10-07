@@ -1,0 +1,1 @@
+-- settings bridge: thingsForEUI loads this once to read the old SavedVariables file

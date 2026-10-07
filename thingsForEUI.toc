@@ -1,0 +1,33 @@
+## Interface: 120100 120007
+## Title: |cFF8AC8FFthings|r for EUI
+## Notes: EUI tweaks, QoL and stuff for healing thigs.
+## Author: A frickin robot
+## Version: 1.2
+## Dependencies: EllesmereUI, EllesmereUIUnitFrames
+## OptionalDeps: EllesmereUIResourceBars, EllesmereUICooldownManager, EllesmereUIRaidFrames
+## X-Wago-ID: O67bD0N3
+## X-Curse-Project-ID: 1732146
+## SavedVariables: EUI_ThingsTweaksDB
+
+Core.lua
+Castbars.lua
+TrackingBars.lua
+TotemBars.lua
+CDMBars.lua
+PassiveCDs.lua
+Racials.lua
+RaidBuilder.lua
+ProfileFixes.lua
+AnchorPoints.lua
+MoveStuff.lua
+BarCopy.lua
+BarStyle.lua
+Trinkets.lua
+Pack\Pack.lua
+Pack\EllesmereUI.lua
+Pack\EditMode.lua
+Pack\BigWigs.lua
+Pack\Baganator.lua
+Pack\CooldownManager.lua
+Installer.lua
+Config.lua
