@@ -34,7 +34,25 @@ local function DB()
     i.done = i.done or {}
     i.pick = i.pick or {}
     i.charNoAsk = i.charNoAsk or {}
+    i.skip = i.skip or {}
+    i.fp = i.fp or {}
     return i
+end
+
+-- what each installed item was installed from, by provider
+local function Stamps(key)
+    local fp = DB().fp
+    fp[key] = fp[key] or {}
+    return fp[key]
+end
+
+-- items: the update popup's list (nil = all)
+local function Picked(items, key)
+    if not items then return true end
+    for _, it in ipairs(items) do
+        if it.key == key then return true end
+    end
+    return false
 end
 
 local function AnyString(list, res)
@@ -106,6 +124,51 @@ local function Fingerprint(str)
     return ("%08x-%d"):format(h, #str)
 end
 
+-- the same hash four bytes a step, for the 100 KB EllesmereUI strings
+local function BigFingerprint(str)
+    local h = 2166136261
+    for n = 1, #str, 4 do
+        local a, b, c, d = str:byte(n, n + 3)
+        h = bit.bxor(h, a + (b or 0) * 256 + (c or 0) * 65536 + (d or 0) * 16777216) % 4294967296
+        h = (h * 403 + (h % 256) * 16777216) % 4294967296
+    end
+    return ("%08x-%d"):format(h, #str)
+end
+
+local function KeyOrder(a, b)
+    local ta, tb = type(a), type(b)
+    if ta ~= tb then return ta < tb end
+    if ta == "number" or ta == "string" then return a < b end
+    return tostring(a) < tostring(b)
+end
+
+-- sorted keys: equal tables always print the same
+local function Canon(v, out)
+    if type(v) == "table" then
+        local keys = {}
+        for k in pairs(v) do keys[#keys + 1] = k end
+        table.sort(keys, KeyOrder)
+        out[#out + 1] = "{"
+        for _, k in ipairs(keys) do
+            Canon(k, out)
+            out[#out + 1] = "="
+            Canon(v[k], out)
+            out[#out + 1] = ","
+        end
+        out[#out + 1] = "}"
+    elseif type(v) == "string" then
+        out[#out + 1] = ("%q"):format(v)
+    else
+        out[#out + 1] = tostring(v)
+    end
+end
+
+local function TableFingerprint(v)
+    local out = {}
+    Canon(v, out)
+    return BigFingerprint(table.concat(out))
+end
+
 -- Blizzard's own reader: "1|" .. Base64(Deflate(CBOR))
 local function DecodeLayouts(str)
     local sep = str:find("|", 1, true)
@@ -170,6 +233,14 @@ local function EntryState(e)
     if not (held and lm and lm:GetLayoutByName(e.name, e.tag)) then return "missing" end
     if held == e.fp or held == "kept:" .. e.fp then return "ok" end
     return "outdated"
+end
+
+local function CDMOutdated()
+    local out = {}
+    for _, e in ipairs(ClassEntries()) do
+        if EntryState(e) == "outdated" then out[#out + 1] = e end
+    end
+    return out
 end
 
 local function SpecName(tag)
@@ -252,6 +323,207 @@ local function ApplySync()
     if #kept > 0 then Say("kept your own EllesmereUI sync groups for " .. table.concat(kept, ", ") .. ".") end
 end
 
+-- ---------------------------------------------------- EllesmereUI updates
+
+-- An installed profile keeps a fingerprint per module of the string it came
+-- from. A changed string is decoded once and compared module by module; the
+-- patch hands EUI's own import only the modules that changed, which it merges
+-- onto the profile and keeps the rest (merge base = the ACTIVE profile, so a
+-- profile is patched while it is active).
+
+local LOOK, OVERRIDES = "\001look", "\001overrides"
+local LOOK_KEYS = { "fonts", "customColors", "darkMode", "euiAccent" }
+-- EUI takes these all or nothing
+local OVERRIDE_KEYS = {
+    "specOverrides", "specOverrideGroups", "specOverrideNextId",
+    "condOverrides", "condOverrideGroups", "condOverrideNextId",
+    "specUnlockOverrides", "condUnlockOverrides", "specBmOverrides", "condBmOverrides",
+    "specDmOverrides", "condDmOverrides", "unlockOverrideAnchors",
+}
+local CDM_FOLDER = "EllesmereUICooldownManager"
+
+local function Copy(v) return type(v) == "table" and CopyTable(v) or v end
+
+-- an entry belongs to the module of the child it places, whatever its target
+local function OwnedLayout(ul, k2f, set)
+    local out = { anchors = {}, widthMatch = {}, heightMatch = {}, widthMatchExtra = {}, heightMatchExtra = {} }
+    for _, name in ipairs({ "anchors", "widthMatch", "heightMatch" }) do
+        if type(ul[name]) == "table" then
+            for child, v in pairs(ul[name]) do
+                if set[k2f[child]] then out[name][child] = Copy(v) end
+            end
+        end
+    end
+    for links, extras in pairs({ widthMatch = "widthMatchExtra", heightMatch = "heightMatchExtra" }) do
+        if type(ul[extras]) == "table" then
+            for child in pairs(out[links]) do out[extras][child] = ul[extras][child] end
+        end
+    end
+    return out
+end
+
+local function LayoutOwners(d)
+    local ul = d.unlockLayout
+    if type(ul) ~= "table" then return nil, {} end
+    local meta = d.unlockLayoutMeta
+    return ul, ns.EUI().BuildImportKeyToFolder(ul, meta and meta.keyToFolder)
+end
+
+local function UnitPrints(payload)
+    local d = payload.data
+    local ul, k2f = LayoutOwners(d)
+    local out = {}
+    for folder, blob in pairs(d.addons or {}) do
+        out[folder] = TableFingerprint({
+            blob, ul and OwnedLayout(ul, k2f, { [folder] = true }) or false,
+            folder == CDM_FOLDER and d.cdmSpells or false,
+        })
+    end
+    local look, ov = {}, {}
+    for _, k in ipairs(LOOK_KEYS) do look[k] = d[k] end
+    for _, k in ipairs(OVERRIDE_KEYS) do ov[k] = d[k] end
+    out[LOOK] = TableFingerprint(look)
+    out[OVERRIDES] = TableFingerprint(ov)
+    return out
+end
+
+local function UnitName(u)
+    if u == LOOK then return "fonts and colors" end
+    if u == OVERRIDES then return "spec overrides and layouts" end
+    local s = u:gsub("^EllesmereUI", "")
+    if s ~= "QoL" then s = s:gsub("(%l)(%u)", "%1 %2") end
+    return s
+end
+
+-- the pack string cut down to the changed units, for a merge onto `cur`
+local function BuildPatch(payload, changed, cur)
+    local d, set = payload.data, {}
+    for _, u in ipairs(changed) do set[u] = true end
+    local out = {}
+    for k, v in pairs(payload) do
+        if k ~= "data" then out[k] = v end
+    end
+    local nd = { _migrations = Copy(d._migrations), addons = {} }
+    for folder, blob in pairs(d.addons or {}) do
+        if set[folder] then nd.addons[folder] = CopyTable(blob) end
+    end
+    local ul, k2f = LayoutOwners(d)
+    if ul then nd.unlockLayout = OwnedLayout(ul, k2f, set) end
+    if set[CDM_FOLDER] then nd.cdmSpells = Copy(d.cdmSpells) end
+    if set[LOOK] then
+        for _, k in ipairs(LOOK_KEYS) do nd[k] = Copy(d[k]) end
+    end
+    if set[OVERRIDES] then
+        for _, k in ipairs(OVERRIDE_KEYS) do nd[k] = Copy(d[k]) end
+        nd.overridesIncluded = true
+    else
+        nd.overridesExcluded = true
+    end
+    -- the import always takes this one, present or not
+    nd.windowSkinLook = cur and cur.windowSkinLook
+    out.data = nd
+    return out
+end
+
+-- this session: [profile] = { str, units, changed, payload }
+local euiPending = {}
+local checkState, checkWaiters = nil, {}
+
+-- decodes only strings that differ from what each profile was installed from
+local function CheckEUI(done)
+    if checkState == "done" then done(); return end
+    checkWaiters[#checkWaiters + 1] = done
+    if checkState == "running" then return end
+    checkState = "running"
+    local eui, res, store = ns.EUI(), Res(), Stamps("eui")
+    local profs = _G.EllesmereUIDB and _G.EllesmereUIDB.profiles or {}
+    local queue = {}
+    for _, p in ipairs(PACK.eui.profiles) do
+        local s = StringFor(p, res)
+        if s and profs[p.name] then
+            local fp = BigFingerprint(s)
+            local rec = store[p.name]
+            if not (rec and rec.str == fp) then queue[#queue + 1] = { name = p.name, s = s, fp = fp } end
+        end
+    end
+    local n = 0
+    local function Next()
+        n = n + 1
+        local q = queue[n]
+        if not q then
+            checkState = "done"
+            local waiting = checkWaiters
+            checkWaiters = {}
+            for _, f in ipairs(waiting) do f() end
+            return
+        end
+        local settled = false
+        local function Got(payload)
+            if settled then return end
+            settled = true
+            if type(payload) == "table" and type(payload.data) == "table" then
+                local units = UnitPrints(payload)
+                local rec = store[q.name]
+                if not rec then
+                    -- installed before this tracked it: the pack as it is now
+                    store[q.name] = { str = q.fp, units = units }
+                else
+                    local changed = {}
+                    for u, fp in pairs(units) do
+                        if (rec.units or {})[u] ~= fp then changed[#changed + 1] = u end
+                    end
+                    if #changed == 0 then
+                        rec.str = q.fp
+                    else
+                        euiPending[q.name] = { str = q.fp, units = units, changed = changed, payload = payload }
+                    end
+                end
+            end
+            C_Timer.After(0, Next)
+        end
+        -- another decode (EUI's import page) cancels ours without calling back
+        C_Timer.After(30, function() Got(nil) end)
+        eui.DecodeImportStringAsync(q.s, Got)
+    end
+    Next()
+end
+
+local function ForgetEUI(name)
+    Stamps("eui")[name] = nil
+    euiPending[name] = nil
+    checkState = nil
+end
+
+local function PatchEUI(done)
+    local eui, db = ns.EUI(), _G.EllesmereUIDB
+    local name = db.activeProfile or "Default"
+    local pend = euiPending[name]
+    if not pend then
+        local other = next(euiPending)
+        if other then Say(other .. " gets its update while it is your active EllesmereUI profile.") end
+        done(false)
+        return
+    end
+    -- the import takes the profile out of its sync groups
+    local groups = {}
+    for folder, members in pairs(db.syncedModules or {}) do
+        if type(members) == "table" and members[name] then groups[#groups + 1] = folder end
+    end
+    local ok, err = eui.ImportProfile(BuildPatch(pend.payload, pend.changed, db.profiles[name]), name)
+    if not ok then
+        Say("EllesmereUI could not patch " .. name .. ": " .. tostring(err))
+        done(false)
+        return
+    end
+    for _, folder in ipairs(groups) do
+        if type(db.syncedModules[folder]) == "table" then db.syncedModules[folder][name] = true end
+    end
+    Stamps("eui")[name] = { str = pend.str, units = pend.units }
+    euiPending[name] = nil
+    needReload = true
+    done(true)
+end
+
 -- ---------------------------------------------------------------- providers
 
 local PROVIDERS = {}
@@ -283,6 +555,25 @@ PROVIDERS[#PROVIDERS + 1] = {
         label = "Sync Groups", done = SyncDone, run = ApplySync,
         usable = function() return (select(2, SyncMembers())) >= 2 end,
     },
+    outdated = function() return next(euiPending) ~= nil end,
+    updateNote = function()
+        local names = {}
+        for name in pairs(euiPending) do names[#names + 1] = name end
+        table.sort(names)
+        return "Update available for " .. table.concat(names, " and ") .. "."
+    end,
+    -- only the active profile can be patched now
+    pending = function()
+        local db = _G.EllesmereUIDB
+        local name = db and (db.activeProfile or "Default")
+        local pend = name and euiPending[name]
+        if not pend then return {} end
+        local parts = {}
+        for _, u in ipairs(pend.changed) do parts[#parts + 1] = UnitName(u) end
+        table.sort(parts)
+        return { { key = "eui:" .. name, target = pend.str, text = name .. ": " .. table.concat(parts, ", ") } }
+    end,
+    update = function(_, done) PatchEUI(done) end,
     install = function(res, done)
         local eui = ns.EUI()
         local profs = _G.EllesmereUIDB.profiles or {}
@@ -304,7 +595,13 @@ PROVIDERS[#PROVIDERS + 1] = {
                         disableAddons = PACK.eui.disable,
                         autoAssignSpecs = true,
                     })
-                    if ok then imported = imported + 1 else fails[#fails + 1] = p.name .. " (" .. tostring(err) .. ")" end
+                    if ok then
+                        imported = imported + 1
+                        -- the next check takes the pack as installed
+                        ForgetEUI(p.name)
+                    else
+                        fails[#fails + 1] = p.name .. " (" .. tostring(err) .. ")"
+                    end
                 end
             end
             if #fails > 0 then Say("EllesmereUI could not import " .. table.concat(fails, ", ") .. ".") end
@@ -348,6 +645,47 @@ local function EMAccountFull()
     return max ~= nil and count >= max, count, max
 end
 
+local function EMActiveName()
+    local list, active = EMLayouts()
+    local l = active and list[active]
+    return l and l.layoutName
+end
+
+local function EMPrint(res)
+    local s = StringFor(PACK.editmode, res)
+    return s and Fingerprint(s)
+end
+
+-- keep: an update leaves this character on the layout it was using
+local function EMImport(res, done, keep)
+    local name = PACK.editmode.layout
+    -- never free a slot by removing one of the user's layouts
+    local full, count, max = EMAccountFull()
+    if full and not EMIndex(name) then
+        Say(("Edit Mode has no free account layout (%d of %d). Delete one in Edit Mode and install again.")
+            :format(count, max))
+        done(false)
+        return
+    end
+    local before = keep and EMActiveName()
+    -- guarded like EUI's own preset import calls it
+    local ok, applied = pcall(ns.EUI().ApplyPresetEditMode, StringFor(PACK.editmode, res), name)
+    HideForbiddenPopup()
+    if ok and applied then
+        Stamps("editmode")[name] = EMPrint(res)
+        local idx = before and before ~= name and EMIndex(before)
+        if idx then
+            C_EditMode.SetActiveLayout(idx)
+            HideForbiddenPopup()
+        end
+        -- Edit Mode stays tainted until a reload
+        needReload = true
+    else
+        Say("Edit Mode could not import the layout" .. (ok and "." or (": " .. tostring(applied))))
+    end
+    done(ok and applied)
+end
+
 PROVIDERS[#PROVIDERS + 1] = {
     key = "editmode", title = "Edit Mode (Blizzard)", perChar = true,
     loaded = function()
@@ -363,41 +701,32 @@ PROVIDERS[#PROVIDERS + 1] = {
         return out
     end,
     exists = function(name) return EMIndex(name) ~= nil end,
-    current = function()
-        local list, active = EMLayouts()
-        local l = active and list[active]
-        return l and l.layoutName
-    end,
+    current = EMActiveName,
     installed = function() return EMIndex(PACK.editmode.layout) ~= nil end,
-    install = function(res, done)
+    adopt = function(res)
+        local name, st = PACK.editmode.layout, Stamps("editmode")
+        if st[name] == nil and EMIndex(name) then st[name] = EMPrint(res) end
+    end,
+    outdated = function()
         local name = PACK.editmode.layout
-        local function Run()
-            -- never free a slot by removing one of the user's layouts
-            local full, count, max = EMAccountFull()
-            if full and not EMIndex(name) then
-                Say(("Edit Mode has no free account layout (%d of %d). Delete one in Edit Mode and install again.")
-                    :format(count, max))
-                done(false)
-                return
-            end
-            -- guarded like EUI's own preset import calls it
-            local ok, applied = pcall(ns.EUI().ApplyPresetEditMode, StringFor(PACK.editmode, res), name)
-            HideForbiddenPopup()
-            if ok and applied then
-                -- Edit Mode stays tainted until a reload
-                needReload = true
-            else
-                Say("Edit Mode could not import the layout" .. (ok and "." or (": " .. tostring(applied))))
-            end
-            done(ok and applied)
-        end
-        if EMIndex(name) then
-            Confirm("Edit Mode", "The Edit Mode layout " .. name .. " already exists. Overwrite it with the pack's version?",
-                Run, function() done(true) end)
+        local st, now = Stamps("editmode")[name], EMPrint(Res())
+        return st ~= nil and now ~= nil and st ~= now and EMIndex(name) ~= nil
+    end,
+    pending = function(res)
+        local name = PACK.editmode.layout
+        local st, now = Stamps("editmode")[name], EMPrint(res)
+        if not (st and now and st ~= now and EMIndex(name)) then return {} end
+        return { { key = "editmode", target = now, text = "Edit Mode layout " .. name } }
+    end,
+    install = function(res, done)
+        if EMIndex(PACK.editmode.layout) then
+            Confirm("Edit Mode", "The Edit Mode layout " .. PACK.editmode.layout .. " already exists. Overwrite it with the pack's version?",
+                function() EMImport(res, done) end, function() done(true) end)
         else
-            Run()
+            EMImport(res, done)
         end
     end,
+    update = function(res, done) EMImport(res, done, true) end,
     load = function(name)
         local idx = EMIndex(name)
         if not idx then return end
@@ -510,6 +839,63 @@ local function WriteAuras(name, data)
     end
 end
 
+local function BWPrint(bp, res)
+    local s = StringFor(bp, res)
+    return s and Fingerprint(s .. "\n" .. (ResString(bp.auras, res) or ""))
+end
+
+-- installed pack profiles whose string or auras changed since
+local function BWChanged(res)
+    local st, out = Stamps("bigwigs"), {}
+    for _, bp in ipairs(PACK.bigwigs.profiles) do
+        local now = BWPrint(bp, res)
+        if now and st[bp.name] and st[bp.name] ~= now and _G.BigWigsAPI.IsValidProfile(bp.name) then
+            out[#out + 1] = bp
+        end
+    end
+    return out
+end
+
+-- one at a time (every import raises BigWigs' own popup); BigWigs swaps to
+-- each, so the one this spec uses goes last
+local function BWImport(todo, res, overwrite, done)
+    local eui, spec = ns.EUI(), GetSpecialization()
+    local specID = spec and GetSpecializationInfo(spec)
+    local mine = specID and eui.GetSpecProfile and eui.GetSpecProfile(specID)
+    for i, bp in ipairs(todo) do
+        if (bp.eui or bp.name) == mine then table.insert(todo, table.remove(todo, i)); break end
+    end
+    if #todo > 1 then
+        Say("BigWigs asks once per profile and says it will swap to it. Each spec gets the right one afterwards.")
+    end
+    local n, tried, accepted = 0, 0, 0
+    local function Next()
+        n = n + 1
+        local bp = todo[n]
+        if not bp then
+            local pick = DB().pick.bigwigs
+            if accepted > 0 and (pick or BWDefault()) == FOLLOW then ApplyFollow() end
+            done(tried == 0 or accepted > 0)
+            return
+        end
+        if not overwrite and _G.BigWigsAPI.IsValidProfile(bp.name) then Next(); return end
+        tried = tried + 1
+        -- BigWigs rejects a bad string with error()
+        local ok, err = pcall(_G.BigWigsAPI.RegisterProfile, PACK.name, StringFor(bp, res), bp.name,
+            function(yes)
+                if yes then
+                    accepted = accepted + 1
+                    local auras = DecodeAuras(ResString(bp.auras, res) or "")
+                    if auras then WriteAuras(bp.name, auras) end
+                    Stamps("bigwigs")[bp.name] = BWPrint(bp, res)
+                end
+                C_Timer.After(0, Next)
+            end)
+        if not ok then Say("BigWigs: " .. tostring(err)); Next() end
+    end
+    Next()
+end
+
 function ns.CaptureBigWigsAuras()
     local eui = ns.EUI()
     if not (_G.BigWigsAPI and _G.BigWigs3DB and eui and eui.ShowCopyPopup) then
@@ -543,6 +929,20 @@ PROVIDERS[#PROVIDERS + 1] = {
         end
         return true
     end,
+    adopt = function(res)
+        local st = Stamps("bigwigs")
+        for _, bp in ipairs(PACK.bigwigs.profiles) do
+            if st[bp.name] == nil and _G.BigWigsAPI.IsValidProfile(bp.name) then st[bp.name] = BWPrint(bp, res) end
+        end
+    end,
+    outdated = function() return #BWChanged(Res()) > 0 end,
+    pending = function(res)
+        local out = {}
+        for _, bp in ipairs(BWChanged(res)) do
+            out[#out + 1] = { key = "bigwigs:" .. bp.name, target = BWPrint(bp, res), text = "BigWigs profile " .. bp.name }
+        end
+        return out
+    end,
     install = function(res, done)
         local todo, existing = {}, {}
         for _, bp in ipairs(PACK.bigwigs.profiles) do
@@ -552,50 +952,20 @@ PROVIDERS[#PROVIDERS + 1] = {
             end
         end
         if #todo == 0 then done(false); return end
-        -- BigWigs swaps to each import; the one this spec uses goes last
-        local eui, spec = ns.EUI(), GetSpecialization()
-        local specID = spec and GetSpecializationInfo(spec)
-        local mine = specID and eui.GetSpecProfile and eui.GetSpecProfile(specID)
-        for i, bp in ipairs(todo) do
-            if (bp.eui or bp.name) == mine then table.insert(todo, table.remove(todo, i)); break end
-        end
-        local function Run(overwrite)
-            if #todo > 1 then
-                Say("BigWigs asks once per profile and says it will swap to it. Each spec gets the right one afterwards.")
-            end
-            local n, tried, accepted = 0, 0, 0
-            -- one at a time: every import raises BigWigs' own popup
-            local function Next()
-                n = n + 1
-                local bp = todo[n]
-                if not bp then
-                    local pick = DB().pick.bigwigs
-                    if accepted > 0 and (pick or BWDefault()) == FOLLOW then ApplyFollow() end
-                    done(tried == 0 or accepted > 0)
-                    return
-                end
-                if not overwrite and _G.BigWigsAPI.IsValidProfile(bp.name) then Next(); return end
-                tried = tried + 1
-                -- BigWigs rejects a bad string with error()
-                local ok, err = pcall(_G.BigWigsAPI.RegisterProfile, PACK.name, StringFor(bp, res), bp.name,
-                    function(yes)
-                        if yes then
-                            accepted = accepted + 1
-                            local auras = DecodeAuras(ResString(bp.auras, res) or "")
-                            if auras then WriteAuras(bp.name, auras) end
-                        end
-                        C_Timer.After(0, Next)
-                    end)
-                if not ok then Say("BigWigs: " .. tostring(err)); Next() end
-            end
-            Next()
-        end
         if #existing > 0 then
             Confirm("BigWigs", table.concat(existing, " and ") .. " already exist. Overwrite with the pack's version?",
-                function() Run(true) end, function() Run(false) end)
+                function() BWImport(todo, res, true, done) end, function() BWImport(todo, res, false, done) end)
         else
-            Run(false)
+            BWImport(todo, res, false, done)
         end
+    end,
+    update = function(res, done, items)
+        local todo = {}
+        for _, bp in ipairs(BWChanged(res)) do
+            if Picked(items, "bigwigs:" .. bp.name) then todo[#todo + 1] = bp end
+        end
+        if #todo == 0 then done(true); return end
+        BWImport(todo, res, true, done)
     end,
     load = function(name)
         local db = BWDB()
@@ -605,6 +975,37 @@ PROVIDERS[#PROVIDERS + 1] = {
         db:SetProfile(name)
     end,
 }
+
+local function BagPrint(res)
+    local s = StringFor(PACK.baganator, res)
+    return s and Fingerprint(s)
+end
+
+-- the pack string's print when the installed profile came from an older one
+local function BagChanged(res)
+    local name = PACK.baganator.profile
+    local st, now = Stamps("baganator")[name], BagPrint(res)
+    if st and now and st ~= now and (_G.BAGANATOR_CONFIG.Profiles or {})[name] then return now end
+end
+
+-- keep: an update leaves this character on the profile it was using
+local function BagImport(res, done, keep)
+    local name = PACK.baganator.profile
+    local before = _G.BAGANATOR_CURRENT_PROFILE
+    -- Baganator rejects a bad string with error()
+    local ok, err = pcall(_G.Baganator.API.ImportString, StringFor(PACK.baganator, res), name)
+    if ok then
+        Stamps("baganator")[name] = BagPrint(res)
+        -- the import switched this character; the per-character key is read at load
+        if keep and before and before ~= name then
+            _G.BAGANATOR_CURRENT_PROFILE = before
+            needReload = true
+        end
+    else
+        Say("Baganator: " .. tostring(err))
+    end
+    done(ok)
+end
 
 PROVIDERS[#PROVIDERS + 1] = {
     key = "baganator", title = "Baganator", perChar = true,
@@ -622,21 +1023,26 @@ PROVIDERS[#PROVIDERS + 1] = {
     exists = function(name) return (_G.BAGANATOR_CONFIG.Profiles or {})[name] ~= nil end,
     current = function() return _G.BAGANATOR_CURRENT_PROFILE end,
     installed = function() return (_G.BAGANATOR_CONFIG.Profiles or {})[PACK.baganator.profile] ~= nil end,
+    adopt = function(res)
+        local name, st = PACK.baganator.profile, Stamps("baganator")
+        if st[name] == nil and (_G.BAGANATOR_CONFIG.Profiles or {})[name] then st[name] = BagPrint(res) end
+    end,
+    outdated = function() return BagChanged(Res()) ~= nil end,
+    pending = function(res)
+        local now = BagChanged(res)
+        if not now then return {} end
+        return { { key = "baganator", target = now, text = "Baganator profile " .. PACK.baganator.profile } }
+    end,
     install = function(res, done)
         local name = PACK.baganator.profile
-        local function Run()
-            -- Baganator rejects a bad string with error()
-            local ok, err = pcall(_G.Baganator.API.ImportString, StringFor(PACK.baganator, res), name)
-            if not ok then Say("Baganator: " .. tostring(err)) end
-            done(ok)
-        end
         if (_G.BAGANATOR_CONFIG.Profiles or {})[name] then
             Confirm("Baganator", "The Baganator profile " .. name .. " already exists. Overwrite it with the pack's version?",
-                Run, function() done(true) end)
+                function() BagImport(res, done) end, function() done(true) end)
         else
-            Run()
+            BagImport(res, done)
         end
     end,
+    update = function(res, done) BagImport(res, done, true) end,
     -- no public switch: the per-character key is read at load
     load = function(name)
         _G.BAGANATOR_CURRENT_PROFILE = name
@@ -655,11 +1061,15 @@ PROVIDERS[#PROVIDERS + 1] = {
         end
         return true
     end,
-    outdated = function()
-        for _, e in ipairs(ClassEntries()) do
-            if EntryState(e) == "outdated" then return true end
+    outdated = function() return #CDMOutdated() > 0 end,
+    updateNote = function() return "Update available on this character." end,
+    pending = function()
+        local out = {}
+        for _, e in ipairs(CDMOutdated()) do
+            out[#out + 1] = { key = "cdm:" .. CharKey() .. ":" .. e.tag, target = e.fp,
+                text = "Cooldown Manager layout " .. SpecName(e.tag) }
         end
-        return false
+        return out
     end,
     -- one button per spec of this character's class
     parts = function()
@@ -669,10 +1079,11 @@ PROVIDERS[#PROVIDERS + 1] = {
         end
         return out
     end,
+    -- only: one entry (a spec button) or a list of them
     install = function(_, done, only)
         local lm, store, cur = LM(), CDMStore(), CurrentTag()
         local all, todo = ClassEntries(), {}
-        for _, e in ipairs(only and { only } or all) do
+        for _, e in ipairs(only and (only.tag and { only } or only) or all) do
             if only or EntryState(e) ~= "ok" then todo[#todo + 1] = e end
         end
         if #todo == 0 then todo = all end
@@ -729,6 +1140,18 @@ PROVIDERS[#PROVIDERS + 1] = {
     end,
 }
 
+do
+    local cdm = PROVIDERS[#PROVIDERS]
+    cdm.update = function(res, done, items)
+        local list = {}
+        for _, e in ipairs(CDMOutdated()) do
+            if Picked(items, "cdm:" .. CharKey() .. ":" .. e.tag) then list[#list + 1] = e end
+        end
+        if #list == 0 then done(true); return end
+        cdm.install(res, done, list)
+    end
+end
+
 -- ------------------------------------------------------------------ state
 
 local function Want(p)
@@ -742,10 +1165,7 @@ end
 local function Usable(p, res) return p.loaded() and p.has(res) end
 
 local function UpdateFor(p)
-    if p.outdated then return p.loaded() and p.outdated() end
-    local i = DB()
-    local v = i and i.done[p.key]
-    return v ~= nil and v < PACK.version
+    return p.outdated ~= nil and p.loaded() and p.outdated()
 end
 
 local function Mismatched(p)
@@ -777,12 +1197,37 @@ local function RunInstall(p, res, after, only)
     end, only)
 end
 
+-- items: the popup's picks; nil = everything that has an update
+local function RunUpdate(p, res, after, items)
+    if InCombatLockdown() then Say("not in combat."); return end
+    p.update(res, after or function() end, items)
+end
+
 -- installed by hand or before this tracked it: counts as the current pack
 local function Adopt(res)
     local i = DB()
     for _, p in ipairs(PROVIDERS) do
-        if i.done[p.key] == nil and Usable(p, res) and p.installed() then i.done[p.key] = PACK.version end
+        if Usable(p, res) then
+            if i.done[p.key] == nil and p.installed() then i.done[p.key] = PACK.version end
+            if p.adopt then p.adopt(res) end
+        end
     end
+end
+
+-- what the update popup offers: not yet answered with "Not now" at this version
+local function PendingItems(res)
+    local skip, out = DB().skip, {}
+    for _, p in ipairs(PROVIDERS) do
+        if p.pending and Usable(p, res) then
+            for _, it in ipairs(p.pending(res)) do
+                if skip[it.key] ~= it.target then
+                    it.p = p
+                    out[#out + 1] = it
+                end
+            end
+        end
+    end
+    return out
 end
 
 local function LoadFor(p, after)
@@ -798,6 +1243,14 @@ local Refresh
 
 local function CloseWindow()
     if win then win.dimmer:Hide() end
+end
+
+local function AskReload()
+    if not needReload then return end
+    ns.EUI():ShowConfirmPopup({
+        title = "Reload Required", message = "What you installed takes effect after a reload.",
+        confirmText = "Reload Now", cancelText = "Later", reload = true,
+    })
 end
 
 local function Btn(parent, text, point, rel, relPoint, x, y, onClick, enabled)
@@ -828,10 +1281,8 @@ local function Label(p, name) return p.label and p.label(name) or name end
 local function StatusOf(p, res)
     if not p.loaded() then return "|cff888888" .. p.title .. " is not installed or not enabled.|r" end
     if not p.has(res) then return "|cff888888" .. (p.none or ("Not part of the pack for " .. res .. ".")) .. "|r" end
-    local i = DB()
     if UpdateFor(p) then
-        if p.outdated then return "|cffffd100Update available on this character.|r" end
-        return ("|cffffd100Update available (pack v%d, you have v%d).|r"):format(PACK.version, i.done[p.key])
+        return "|cffffd100" .. (p.updateNote and p.updateNote() or "Update available.") .. "|r"
     end
     if p.installed() then return "|cff0dd29fInstalled.|r" end
     return "|cffff5555Not installed.|r"
@@ -874,9 +1325,10 @@ local function BuildRow(c, p, y, res)
         end
     end
 
-    local label = (UpdateFor(p) and "Update") or ((p.loaded() and p.installed()) and "Reinstall") or "Install"
+    local update = UpdateFor(p)
+    local label = (update and "Update") or ((p.loaded() and p.installed()) and "Reinstall") or "Install"
     Btn(c, label, "TOPRIGHT", c, "TOPRIGHT", -24, y, function()
-        RunInstall(p, res, function() Refresh() end)
+        if update then RunUpdate(p, res, function() Refresh() end) else RunInstall(p, res, function() Refresh() end) end
     end, usable)
 
     if p.extra and p.loaded() then
@@ -923,6 +1375,14 @@ Refresh = function()
     local res = Res()
     local i = DB()
     Adopt(res)
+    -- EllesmereUI updates need a decode: the window refreshes when it lands
+    if checkState == nil then
+        CheckEUI(function()
+            C_Timer.After(0, function()
+                if win and win.dimmer:IsShown() then Refresh() end
+            end)
+        end)
+    end
 
     local title = Text(c, 18)
     title:SetPoint("TOPLEFT", c, "TOPLEFT", 24, -20)
@@ -972,7 +1432,7 @@ Refresh = function()
             n = n + 1
             local p = queue[n]
             if not p then Refresh(); return end
-            RunInstall(p, res, Next)
+            if UpdateFor(p) then RunUpdate(p, res, Next) else RunInstall(p, res, Next) end
         end
         Next()
     end)
@@ -991,14 +1451,8 @@ Refresh = function()
     reload:SetScript("OnClick", ReloadUI)
 
     Btn(c, "Close", "BOTTOMRIGHT", c, "BOTTOMRIGHT", -24, 18, function()
-        i.updateSeen = PACK.version
         CloseWindow()
-        if needReload then
-            eui:ShowConfirmPopup({
-                title = "Reload Required", message = "What you installed takes effect after a reload.",
-                confirmText = "Reload Now", cancelText = "Later", reload = true,
-            })
-        end
+        AskReload()
     end, true)
     Btn(c, "Don't Show Again", "BOTTOMLEFT", c, "BOTTOMLEFT", 24, 18, function()
         i.declined = true
@@ -1045,29 +1499,95 @@ boot:SetScript("OnEvent", function(self, _, name)
     end
 end)
 
+-- ---------------------------------------------------------------- updates
+
+local function RunUpdates(items)
+    local order, byP = {}, {}
+    for _, it in ipairs(items) do
+        if not byP[it.p] then
+            byP[it.p] = {}
+            order[#order + 1] = it.p
+        end
+        table.insert(byP[it.p], it)
+    end
+    local n = 0
+    local function Next()
+        n = n + 1
+        local p = order[n]
+        if not p then C_Timer.After(0.2, AskReload); return end
+        RunUpdate(p, Res(), Next, byP[p])
+    end
+    Next()
+end
+
+-- once per item and version a session; "Not now" stops it asking again
+local asked = {}
+local function PromptUpdates()
+    local i = DB()
+    if not i or i.declined or InCombatLockdown() or (win and win.dimmer:IsShown()) then return end
+    local fresh, lines = {}, {}
+    for _, it in ipairs(PendingItems(Res())) do
+        local id = it.key .. "\031" .. it.target
+        if not asked[id] then
+            asked[id] = true
+            fresh[#fresh + 1] = it
+            lines[#lines + 1] = it.text
+        end
+    end
+    if #fresh == 0 then return end
+    ns.EUI():ShowConfirmPopup({
+        title = PACK.name .. " update",
+        message = "Updated in the pack:\n" .. table.concat(lines, "\n"),
+        disclaimer = "EllesmereUI only gets the parts listed, the rest of your profile stays. "
+            .. "Other addons get the whole profile or layout.",
+        confirmText = "Patch", cancelText = "Not now",
+        onConfirm = function() RunUpdates(fresh) end,
+        onCancel = function()
+            for _, it in ipairs(fresh) do i.skip[it.key] = it.target end
+            Say("skipped. /tui install still shows them in yellow.")
+        end,
+    })
+end
+
 local openAtRegen = false
 local function AutoOpen()
     if InCombatLockdown() then openAtRegen = true; return end
     openAtRegen = false
     local i = DB()
-    if not i or i.declined or i.charNoAsk[CharKey()] or (win and win.dimmer:IsShown()) then return end
+    if not i or i.declined or (win and win.dimmer:IsShown()) then return end
     local res = Res()
     Adopt(res)
+    local skipChar = i.charNoAsk[CharKey()]
     if EUIHasString(res) and not i.done.eui then
-        ns.OpenInstaller()
+        if not skipChar then ns.OpenInstaller() end
         return
     end
-    if i.updateSeen ~= PACK.version then
-        for _, p in ipairs(PROVIDERS) do
-            if Usable(p, res) and UpdateFor(p) then ns.OpenInstaller(); return end
+    CheckEUI(function()
+        if InCombatLockdown() then openAtRegen = true; return end
+        if #PendingItems(Res()) > 0 then
+            PromptUpdates()
+        elseif not skipChar and AnyMismatch() then
+            ns.OpenInstaller()
         end
-    end
-    if AnyMismatch() then ns.OpenInstaller() end
+    end)
 end
 
 ns.bootOnly[#ns.bootOnly + 1] = function() C_Timer.After(4, AutoOpen) end
 ns.onRegen[#ns.onRegen + 1] = function()
     if openAtRegen then AutoOpen() end
+end
+
+-- a profile switch: the newly active EllesmereUI profile's own update
+local switchHooked = false
+ns.maintainers[#ns.maintainers + 1] = function()
+    local eui = ns.EUI()
+    if switchHooked or not (eui and type(eui.RefreshAllAddons) == "function") then return end
+    switchHooked = true
+    hooksecurefunc(eui, "RefreshAllAddons", function()
+        C_Timer.After(3, function()
+            if checkState == "done" then PromptUpdates() end
+        end)
+    end)
 end
 
 SLASH_THINGSTWEAKS1 = "/tui"

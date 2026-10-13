@@ -1,8 +1,8 @@
-## Interface: 120100, 120007
+## Interface: 120100, 120105
 ## Title: |cFF8AC8FFthings|r for EUI
 ## Notes: EUI tweaks, QoL and stuff for healing thigs.
 ## Author: A frickin robot
-## Version: 1.2
+## Version: 1.3
 ## Dependencies: EllesmereUI, EllesmereUIUnitFrames
 ## OptionalDeps: EllesmereUIResourceBars, EllesmereUICooldownManager, EllesmereUIRaidFrames
 ## X-Wago-ID: O67bD0N3

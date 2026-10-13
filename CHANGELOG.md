@@ -1,4 +1,6 @@
 # Changelog
+## 1.3 (2026-10-xx)
+- Game version (TOC)
 ## 1.2 (2026-10-07)
 - Renamed to **things for EUI** cause I was breaking Ellesmere's rules 🙈 Read the FAQ next time dumbdumb.. Anywhooo, the folder is now `thingsForEUI`. Just update, your settings move over on your first login. After that you can delete the `EllesmereUIThings` folder if you want.
 - Options have their own "things for EUI" section in the EllesmereUI sidebar

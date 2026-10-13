@@ -3,10 +3,11 @@ local _, ns = ...
 -- ------------------------------------------------------------ install pack
 
 -- The strings live next to this file, one per addon. HOW TO UPDATE: paste a
--- fresh export between the [==[ ]==] brackets (no escaping needed) and bump
--- `version`, so accounts that already installed are offered the update. An
--- empty string leaves that addon or resolution out; with no EllesmereUI
--- string at all the installer never opens by itself.
+-- fresh export between the [==[ ]==] brackets (no escaping needed). Accounts
+-- that installed are asked to patch what changed (EllesmereUI: only the
+-- modules that differ), found from the strings themselves. An empty string
+-- leaves that addon or resolution out; with no EllesmereUI string at all the
+-- installer never opens by itself.
 
 ns.PACK = {
     name    = "thingsEUI",
